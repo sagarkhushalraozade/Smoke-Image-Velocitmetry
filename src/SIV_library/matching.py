@@ -1,18 +1,25 @@
 from torch.nn.functional import conv2d, pad, interpolate
 import torch
 
+import numpy as np
+from scipy.ndimage import median_filter
 
-def block_match(windows: torch.Tensor, areas: torch.Tensor, mode: int) -> torch.Tensor:
+
+def block_match(windows: torch.Tensor, areas: torch.Tensor, mode: int, batch_size: int = 10) -> torch.Tensor:
     windows, areas = windows.float(), areas.float()
     (count, window_rows, window_cols), (area_rows, area_cols) = windows.shape, areas.shape[-2:]
-
+    # print(f'(count = {count}, window_rows = {window_rows}, window_cols = {window_cols}), (area_rows = {area_rows}, area_cols = {area_cols}')
+    
     # [6] - all windows with intensity std < 4 will be ignored (error-prone)
     stds = torch.std(windows, dim=(1, 2))
     err = torch.where(stds < 4., True, False).to(windows.device)
     areas[err] = torch.zeros((area_rows, area_cols)).to(windows.device)
 
+    
     res = torch.zeros((count, area_rows - window_rows + 1, area_cols - window_cols + 1), device=windows.device)
-
+    
+    # print(f'Shape of windows = {windows.shape}, shape of areas = {areas.shape}')
+    
     if mode == 0:  # correlation mode
         for idx, (window, area) in enumerate(zip(windows, areas)):
             corr = conv2d(area.unsqueeze(0).unsqueeze(0), window.unsqueeze(0).unsqueeze(0), stride=1)
@@ -29,7 +36,6 @@ def block_match(windows: torch.Tensor, areas: torch.Tensor, mode: int) -> torch.
 
     # normalized output
     return res / (window_rows * window_cols)
-
 
 def window_array(array: torch.Tensor, window_size, overlap,
                  area: tuple[int, int, int, int] | None = None) -> torch.Tensor:
@@ -198,3 +204,46 @@ class WindowShift:
         areas = torch.gather(img_b.view(-1), -1, b_grid.view(-1)).reshape(self.idx_b.shape)
 
         return windows, areas, u, v
+
+def remove_outliers(velocities, std_threshold=2.0, window_size=3):
+    
+    # Padding to handle edges
+    pad_size = window_size // 2
+    padded = pad(velocities, (pad_size, pad_size, pad_size, pad_size), "constant", 0)
+    
+    # Unfold to create sliding windows
+    unfolded = padded.unfold(0, window_size, 1).unfold(1, window_size, 1)
+    unfolded = unfolded.contiguous().view(unfolded.size(0), unfolded.size(1), -1)
+    
+    # Calculate mean and std within each window
+    means = unfolded.mean(dim=(-1))
+    stds = unfolded.std(dim=(-1))
+    
+    outliers = (velocities < (means - std_threshold * stds)) | (velocities > (means + std_threshold * stds))
+    cleaned_velocities = velocities.clone()
+    cleaned_velocities[outliers] = means[outliers]
+
+    return cleaned_velocities
+
+def median_smoothing(velocities, window_size=3):
+    pad_size = window_size // 2
+    padded = pad(velocities, (pad_size, pad_size, pad_size, pad_size), "constant", 0)
+
+    unfolded = padded.unfold(0, window_size, 1).unfold(1, window_size, 1)
+    unfolded = unfolded.contiguous().view(unfolded.size(0), unfolded.size(1), -1)
+    
+    medians = unfolded.median(dim=-1).values
+    return medians
+
+def process_velocity_fields(up, vp, std_threshold=2.0, window_size=3):
+    up_cleaned = remove_outliers(up, std_threshold, window_size)
+    vp_cleaned = remove_outliers(vp, std_threshold, window_size)
+
+    up_smoothed = median_smoothing(up_cleaned, window_size)
+    vp_smoothed = median_smoothing(vp_cleaned, window_size)
+
+    return up_smoothed, vp_smoothed
+
+
+
+

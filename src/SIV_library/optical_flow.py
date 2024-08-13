@@ -8,11 +8,19 @@ Torch adaptation of pure python implementation
 """
 
 import torch
-from torch.nn.functional import conv2d, pad
+from torch.nn.functional import conv2d, pad, avg_pool2d
 from tqdm import tqdm
+import numpy as np
 
 
-def optical_flow(img1, img2, alpha, num_iter, eps):
+def pad_to_multiple(tensor, multiple):
+    h, w = tensor.shape[-2:]
+    pad_h = (multiple - (h % multiple)) % multiple
+    pad_w = (multiple - (w % multiple)) % multiple
+    padding = (0, pad_w, 0, pad_h)  # (left, right, top, bottom)
+    return pad(tensor, padding, mode='reflect')
+
+def optical_flow(img1, img2, alpha, num_iter, eps, grid_size):
     device = img1.device
 
     a, b = img1[None, :, :, :].float(), img2[None, :, :, :].float()
@@ -36,12 +44,31 @@ def optical_flow(img1, img2, alpha, num_iter, eps):
         # MSE early stopping https://www.ipol.im/pub/art/2013/20/article.pdf
         delta = torch.sum((u_new - u) ** 2) + torch.sum((v_new - v) ** 2)
         delta /= a.shape[-2] * a.shape[-1]
+        
+        # print(f'iter = {i}, delta = {delta}')
 
         if eps is not None and delta < eps:
             break
 
         u, v = u_new, v_new
-    return u.squeeze(), v.squeeze()
+        
+    # Sagar start.
+    u_padded = pad_to_multiple(u, grid_size)
+    v_padded = pad_to_multiple(v, grid_size)
+    
+    u_avg = avg_pool2d(u_padded, kernel_size=grid_size)
+    v_avg = avg_pool2d(v_padded, kernel_size=grid_size)
+    
+    _, _ ,h, w = u_avg.shape
+    ya, xa = torch.meshgrid(torch.arange(grid_size // 2, h * grid_size, grid_size), torch.arange(grid_size // 2, w * grid_size, grid_size))
+    
+    # print(f"Shape of u is {u.shape}")
+    # print(f"Shape of u_avg is {u_avg.shape}")
+    # print(f"Shape of xa is {xa.shape}")
+    # print(f"Shape of ya is {ya.shape}")
+    # Sagar end.
+        
+    return xa, ya, u_avg.squeeze(), v_avg.squeeze()
 
 
 def compute_derivatives(img1: torch.Tensor, img2: torch.Tensor):

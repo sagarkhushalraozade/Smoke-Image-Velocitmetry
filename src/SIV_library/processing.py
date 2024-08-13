@@ -61,10 +61,10 @@ class Processor:
 
     def __init__(self, path: str, df: str) -> None:
         dirs = path.split('/')
-        self.root = '/'.join(dirs[:-1])
+        self.root = '/'.join(dirs[:-1]) # /Test Data
 
-        self.dir = dirs[-1]
-        self.df = df  # data format for frame images
+        self.dir = dirs[-1] # Img_xxxx
+        self.df = df  # data format for frame images # png
         self.reference = None  # for smoke masking
 
     @staticmethod
@@ -72,6 +72,11 @@ class Processor:
         # clean_img = cv2.fastNlMeansDenoising(image, None, h=3, templateWindowSize=7, searchWindowSize=21)
         clean_img = cv2.medianBlur(image, 3)
         return clean_img
+    
+    def clahe(self, image: np.ndarray) -> np.ndarray:
+        clahe_template = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        equalized = clahe_template.apply(image)
+        return equalized
 
     # isolate smoke by subtracting reference image (see Jonas paper)
     def mask(self, image: np.ndarray) -> np.ndarray:
@@ -86,26 +91,48 @@ class Processor:
         except FileExistsError:
             print(f"Directory '{self.root}/{self.dir}_PROCESSED' already exists")
             return
+        
+        # Sagar - Create an image file with the minimum pixel intensity from all files.
+        min_intensity_file_count = 0
+        for file in os.listdir(f"{self.root}/{self.dir}"):
+            if min_intensity_file_count == 0:
+                min_intensity_file = cv2.imread(f"{self.root}/{self.dir}/{file}", cv2.IMREAD_GRAYSCALE)
+                min_intensity_file_count+=1
+            else:
+                min_intensity_file = np.minimum(cv2.imread(f"{self.root}/{self.dir}/{file}", cv2.IMREAD_GRAYSCALE), min_intensity_file)
 
-        for file in tqdm(os.listdir(f"{self.root}/{self.dir}"), desc="Processing"):
+        for file in tqdm(sorted(os.listdir(f"{self.root}/{self.dir}")), desc="Processing"):
             idx = file.split('.')[0]
 
-            frame = cv2.imread(f"{self.root}/{self.dir}/{file}", cv2.IMREAD_GRAYSCALE)
-            new_frame = self.denoise(frame)
+            frame = cv2.imread(f"{self.root}/{self.dir}/{file}", cv2.IMREAD_GRAYSCALE) # Read as greyscale.
+            # new_frame = self.denoise(frame) # Commented by Sagar.
+            new_frame = self.clahe(frame) # Adaptive histogram equalization # Sagar.
 
             # set first frame as reference - don't save this one for SIV
             if self.reference is None:
-                self.reference = new_frame
+                # self.reference = new_frame # commented by Sagar
+                self.reference = min_intensity_file # Sagar
+                # self.reference = np.zeros(np.shape(min_intensity_file)) # Sagar
             else:
-                new_frame = self.mask(new_frame)
+                new_frame = self.mask(new_frame) # Commented by Sagar since number of images is too few.
                 cv2.imwrite(f"{self.root}/{self.dir}_PROCESSED/{idx}{self.df}", new_frame)
 
 
 class Viewer:
-    def __init__(self, path: str, capture_fps: float = 240., playback_fps: float = 30.) -> None:
+    def __init__(self, path: str, capture_fps: float = 240., playback_fps: float = 30., siv_window_size: int = 64, siv_overlap: int = 32, siv_search_area: tuple[int, int, int, int] = (0, 0, 0, 0), siv_num_passes: int = 3, optical_flow_flag: bool = False) -> None:
         self.capture_fps, self.playback_fps = capture_fps, playback_fps
 
         files = [f"{path}/{fn}" for fn in os.listdir(path)]
+        
+        path_parts = path.split('/')
+        processed_image_folder = path_parts[-1]
+        video_file_name = processed_image_folder.replace('_PROCESSED','')
+        self.optical_flow_flag = optical_flow_flag
+        
+        if self.optical_flow_flag == False:
+            self.video_save_name = video_file_name + '_WS_' + str(siv_window_size) + '_O_' + str(siv_overlap) + '_SA_' + str(siv_search_area[0]) + '_NP_' + str(siv_num_passes)
+        elif self.optical_flow_flag == True:
+            self.video_save_name = video_file_name + '_Optical_flow'
 
         # sort files by index (to ensure the dataset is sequential)
         self.files = sorted(files, key=lambda x: int(x.split("/")[-1].split(".")[0]))
@@ -129,41 +156,47 @@ class Viewer:
                 break
         cv2.destroyAllWindows()
 
-    def vector_field(self, results: np.ndarray, scale: float) -> None:
+    def vector_field(self, results: np.ndarray, length_scale: float, time_scale: float) -> None:
         fig, ax = plt.subplots()
 
-        velocities = results[:, 2:][1:]  # exclude reference frame (only nan/zero values)
+        velocities = results[:, 2:][1:]*length_scale/time_scale  # exclude reference frame (only nan/zero values). Equivalent to results[1:,2:,:,:] frames x XYUV
         abs_velocities = np.sqrt(velocities[:, 0]**2 + velocities[:, 1]**2)
         min_abs, max_abs = np.min(abs_velocities, axis=0), np.max(abs_velocities, axis=0)
 
         frame = self.read_frame(self.files[0])
-        image = ax.imshow(frame, cmap='gray')
+        image = ax.imshow(frame, cmap='gray', extent=[0, frame.shape[1]*length_scale, 0, frame.shape[0]*length_scale])
 
         # Note: velocity scaling is done for correct color mapping and quiver length
         x0, y0, vx0, vy0 = results[0]
-        new_x0, new_y0 = x0/scale, y0/scale
-        vx0, vy0 = np.flip(vx0, axis=0), np.flip(vy0, axis=0)  # flip velocities for correct IMAGE coords
-        vectors = ax.quiver(new_x0, new_y0, vx0, vy0, max_abs-min_abs, scale=.5, cmap='jet')
-
+        # new_x0, new_y0 = x0/scale, y0/scale # Commented by Sagar
+        new_x0, new_y0 = x0*length_scale, np.flip(y0*length_scale, axis = 0) # Flipping y axis vertically so that y = 0 is at the bottom.
+        vx0, vy0 = vx0*length_scale/time_scale, vy0*length_scale/time_scale
+        # vectors = ax.quiver(new_x0, new_y0, vx0, vy0, max_abs-min_abs, scale = 0.5, cmap='jet') # Commented by Sagar
+        # vectors = ax.quiver(new_x0, new_y0, vx0, vy0, max_abs-min_abs, cmap='jet') # max_abs-min_abs gives the colour
+        vectors = ax.quiver(new_x0, new_y0, vx0, vy0, max_abs-min_abs, scale = 50, cmap='jet', alpha = 0.5)
+        plt.colorbar(vectors, ax = ax)
+        
         def update(idx):
             frame = self.read_frame(self.files[idx])
             image.set_data(frame)
 
             # https://stackoverflow.com/questions/19329039/plotting-animated-quivers-in-python
             vx, vy = results[idx][2], results[idx][3]
-            vx, vy = np.flip(vx, axis=0), np.flip(vy, axis=0)
-            scaling = np.sqrt(vx ** 2 + vy ** 2) - min_abs
-            vectors.set_UVC(vx, vy, scaling)
+            vx, vy = vx*length_scale/time_scale, vy*length_scale/time_scale # Commented by Sagar.
+            color_magnitude = np.sqrt(vx ** 2 + vy ** 2) - min_abs
+            vectors.set_UVC(vx, vy, color_magnitude)
 
             return image, vectors
 
-        ani = animation.FuncAnimation(fig=fig, func=update, frames=len(self.files)-1, interval=1000/self.playback_fps)
+        # ani = animation.FuncAnimation(fig=fig, func=update, frames=len(self.files)-1, interval=1000/self.playback_fps)
+        ani = animation.FuncAnimation(fig=fig, func=update, frames=len(self.files)-1, interval=1000)
 
-        # writer = animation.PillowWriter(fps=15)
-        # ani.save('Test Data/plume.gif', writer=writer)
+        writer = animation.PillowWriter(fps=1) # Sagar
+        ani.save(rf"Test Data/{self.video_save_name}.gif", writer=writer, dpi=200) # Sagar
 
         plt.show()
-
+    
+    # The below function may have to be revisited for axis directions.
     def velocity_field(self, results: np.ndarray, scale: float,
                        resolution: int, interpolation_mode: str) -> None:
         fig, ax = plt.subplots()
@@ -183,7 +216,10 @@ class Viewer:
         new_x0, new_y0 = x0 / scale, y0 / scale
         vx0, vy0 = np.flip(vx0, axis=0), np.flip(vy0, axis=0)
 
-        field = RegularGridInterpolator((new_x0[0, :], new_y0[:, 0]),
+        # field = RegularGridInterpolator((new_x0[0, :], new_y0[:, 0]),
+        #                                 np.sqrt(vx0 ** 2 + vy0 ** 2), method=interpolation_mode,
+        #                                 bounds_error=False, fill_value=0) # Commented by Sagar
+        field = RegularGridInterpolator((new_y0[:, 0], new_x0[0, :]),
                                         np.sqrt(vx0 ** 2 + vy0 ** 2), method=interpolation_mode,
                                         bounds_error=False, fill_value=0)
         values = field((xg, yg))
@@ -193,7 +229,10 @@ class Viewer:
             vx, vy = results[idx][2], results[idx][3]
             vx, vy = np.flip(vx, axis=0), np.flip(vy, axis=0)
 
-            field = RegularGridInterpolator((new_x0[0, :], new_y0[:, 0]),
+            # field = RegularGridInterpolator((new_x0[0, :], new_y0[:, 0]),
+            #                                 np.sqrt(vx ** 2 + vy ** 2), method=interpolation_mode,
+            #                                 bounds_error=False, fill_value=0) # Commented by Sagar
+            field = RegularGridInterpolator((new_y0[:, 0], new_x0[0, :]),
                                             np.sqrt(vx ** 2 + vy ** 2), method=interpolation_mode,
                                             bounds_error=False, fill_value=0)
             values = field((xg, yg))

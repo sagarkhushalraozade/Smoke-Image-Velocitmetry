@@ -1,4 +1,4 @@
-from .matching import window_array, get_field_shape, block_match, get_x_y, correlation_to_displacement, WindowShift
+from .matching import window_array, get_field_shape, block_match, get_x_y, correlation_to_displacement, WindowShift, process_velocity_fields
 from .optical_flow import optical_flow
 from collections.abc import Generator
 
@@ -88,6 +88,9 @@ class SIV:
             du, dv = correlation_to_displacement(match, search_area, n_rows, n_cols, self.mode)
 
             up, vp = (du, dv) if i == 0 else (up + du, vp + dv)
+            
+            up, vp = process_velocity_fields(up, vp, std_threshold=2.0, window_size=3) # window_size should be odd. 3 seems to be nice. 5 leads to too much smoothing.
+            
         return xp, yp, up, -vp
 
 
@@ -98,13 +101,15 @@ class OpticalFlow:
                  alpha: float = 1000.,
                  num_iter: int = 100,
                  eps: float = 1e-5,
+                 grid_size_avg: int = 64,
                  ) -> None:
 
         self.folder = folder
         self.dataset = SIVDataset(folder=folder, device=device)
         self.device = device
         self.alpha, self.num_iter, self.eps = alpha, num_iter, eps
-
+        self.grid_size_avg = grid_size_avg
+        
     def __len__(self) -> int:
         return len(self.dataset)
 
@@ -115,8 +120,9 @@ class OpticalFlow:
 
         loader = DataLoader(self.dataset)
         for a, b in tqdm(loader, total=len(loader), desc='Optical flow'):
-            du, dv = self.run(a, b)
-            yield x, y, du, -dv
+            xa, ya, du, dv = self.run(a, b)
+            # yield x, y, du, -dv # Commented by Sagar.
+            yield xa.to(self.device), ya.to(self.device), du, -dv
 
     def run(self, a, b):
-        return optical_flow(a, b, self.alpha, self.num_iter, self.eps)
+        return optical_flow(a, b, self.alpha, self.num_iter, self.eps, self.grid_size_avg)
